@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
-Aria Headless Client — Interactive Termux Version
-==================================================
+Aria Headless Client — Interactive Termux Version v2
+=====================================================
 pip install requests
 python3 aria_headless.py
+
+Fixes from v1:
+  - openId (bukan account) di login packet
+  - GetConv step sebelum login
+  - conv_id di-update dari GetConv response
+  - Proper connection flow
 """
 import requests, socket, struct, time, warnings, urllib3, sys, threading
 
@@ -70,14 +76,25 @@ def parse_responses(data):
     return results
 
 
-def build_login_packet(token, account):
+def build_login_packet(token, open_id, conv_id=None):
     pkt = bytearray(LOGIN_TEMPLATE)
+
+    # Patch conv_id at offset 0 (4 bytes LE from GetConv response)
+    if conv_id is not None:
+        pkt[0:4] = conv_id
+
+    # KCP timestamp at offset 8
     ts = int(time.time() * 1000) & 0xFFFFFFFF
     pkt[8:12] = struct.pack("<I", ts)
+
+    # Token at offset 418 (32 bytes ASCII hex)
     tok = token.upper().encode("ascii")[:32]
     pkt[418:418+len(tok)] = tok
-    acct = account.encode("ascii")
-    pkt[458:458+len(acct)] = acct
+
+    # openId at offset 458 (NOT account/username!)
+    oid = open_id.encode("ascii")
+    pkt[458:458+len(oid)] = oid
+
     return bytes(pkt)
 
 
@@ -85,6 +102,30 @@ def http_login(account, password):
     data = f"publisher=688&serverId=1&loginId={account}&password={password}"
     r = requests.post(LOGIN_URL, data=data, headers=HEADERS, timeout=10, verify=False)
     return r.json()
+
+
+def do_getconv(host, port):
+    """Step 1: Connect → send GetConv → get conv_id → close."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect((host, port))
+    # GetConv = [4B BE len=2][2B BE opcode=901]
+    s.sendall(b"\x00\x00\x00\x02\x03\x85")
+    print(f"  → GetConv sent (6B)")
+    resp = s.recv(4096)
+    s.close()
+    print(f"  ← Response: {len(resp)}B — {resp.hex()}")
+
+    # Parse: [4B BE len][2B BE opcode=901][body]
+    if len(resp) >= 6:
+        opcode = struct.unpack(">H", resp[4:6])[0]
+        body = resp[6:]
+        print(f"    Opcode: 0x{opcode:04X} ({CMD_NAMES.get(opcode, '?')})")
+        if len(body) >= 4:
+            conv_id = body[0:4]
+            print(f"    ConvID: {conv_id.hex()}")
+            return conv_id
+    return None
 
 
 class Client:
@@ -143,13 +184,15 @@ class Client:
     def close(self):
         self.alive = False
         if self.sock:
-            try: self.sock.close()
-            except: pass
+            try:
+                self.sock.close()
+            except:
+                pass
 
 
 def main():
     print("=" * 48)
-    print("   Aria Headless Client — Termux")
+    print("   Aria Headless Client — Termux v2")
     print("=" * 48)
     print("  Commands after login:")
     print("    ping        — keepalive")
@@ -161,13 +204,14 @@ def main():
     print("=" * 48)
 
     client = None
-    account = token = gs = ""
+    account = ""
 
     while True:
         try:
             cmd = input("\n> ").strip().lower()
         except (EOFError, KeyboardInterrupt):
-            if client: client.close()
+            if client:
+                client.close()
             print("\nBye!")
             break
 
@@ -175,7 +219,8 @@ def main():
             continue
 
         if cmd in ("quit", "exit", "q"):
-            if client: client.close()
+            if client:
+                client.close()
             print("Bye!")
             break
 
@@ -186,6 +231,7 @@ def main():
                 print("  ✗ Required")
                 continue
 
+            # ── Step 1: HTTP Login ──
             print(f"  [1] HTTP login...")
             try:
                 r = http_login(account, password)
@@ -199,7 +245,7 @@ def main():
 
             token = r.get("token", "")
             gs = r.get("gameServer", "")
-            oid = r.get("openId", "")
+            oid = r.get("openId", "")    # ← openId, NOT account!
             rid = r.get("roleId", "")
             print(f"  ✓ Token  : {token[:16]}...")
             print(f"  ✓ Server : {gs}")
@@ -210,9 +256,20 @@ def main():
                 continue
 
             host, port = gs.split(":")
-            print(f"  [2] TCP connect...")
+
+            # ── Step 2: GetConv (separate connection) ──
+            print(f"  [2] GetConv...")
             try:
-                if client: client.close()
+                conv_id = do_getconv(host, int(port))
+            except Exception as e:
+                print(f"  ✗ GetConv error: {e}")
+                conv_id = None
+
+            # ── Step 3: TCP Connect + Login ──
+            print(f"  [3] TCP connect + login...")
+            try:
+                if client:
+                    client.close()
                 client = Client(host, int(port))
                 client.connect()
                 t = threading.Thread(target=client.recv_forever, daemon=True)
@@ -221,11 +278,11 @@ def main():
                 print(f"  ✗ {e}")
                 continue
 
-            print(f"  [3] Send login packet...")
-            pkt = build_login_packet(token, account)
+            # Build login packet with openId + conv_id
+            pkt = build_login_packet(token, oid, conv_id)
             try:
                 client.sock.sendall(pkt)
-                print(f"  ✓ Login sent ({len(pkt)}B)")
+                print(f"  ✓ Login sent ({len(pkt)}B) [openId={oid}, conv={conv_id.hex() if conv_id else 'default'}]")
             except Exception as e:
                 print(f"  ✗ {e}")
                 continue
@@ -235,7 +292,7 @@ def main():
             print(f"  [5] Ping...")
             client.send_raw(900)
             time.sleep(1)
-            print(f"\n  ✓ Ready! Type commands.")
+            print(f"\n  ✓ Ready!")
 
         elif cmd == "ping":
             if not client or not client.alive:
