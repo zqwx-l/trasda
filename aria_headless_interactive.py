@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Aria Headless Client — Interactive Termux Version v2
+Aria Headless Client — Interactive Termux Version v3
 =====================================================
-pip install requests
-python3 aria_headless.py
-
-Fixes from v1:
+Fixes:
   - openId (bukan account) di login packet
   - GetConv step sebelum login
   - conv_id di-update dari GetConv response
-  - Proper connection flow
+  - Plain TCP login (446B) — strip KCP header, proper TCP framing
+  - Option kirim KCP raw (466B) atau plain TCP (446B)
 """
 import requests, socket, struct, time, warnings, urllib3, sys, threading
 
@@ -29,6 +27,8 @@ CMD_NAMES = {
 }
 
 # Full 466-byte login packet captured from game via Frida
+# [0:24] = KCP header (conv, cmd, wnd, ts, sn, una)
+# [24:]  = game payload (opcode + FlatBuffer)
 LOGIN_TEMPLATE = bytes.fromhex(
     "5fc5020051000001d632b5190000000000000000ba0100000064380000000000"
     "000030006000040008000c0010005000140018001c002000240028002c003000"
@@ -77,9 +77,10 @@ def parse_responses(data):
 
 
 def build_login_packet(token, open_id, conv_id=None):
+    """Build full template (466B with KCP header)."""
     pkt = bytearray(LOGIN_TEMPLATE)
 
-    # Patch conv_id at offset 0 (4 bytes LE from GetConv response)
+    # Patch conv_id at offset 0
     if conv_id is not None:
         pkt[0:4] = conv_id
 
@@ -98,6 +99,16 @@ def build_login_packet(token, open_id, conv_id=None):
     return bytes(pkt)
 
 
+def build_plain_tcp(token, open_id, conv_id=None):
+    """Build plain TCP login (446B): [4B BE len][2B opcode][FlatBuffer].
+       Strips KCP header from template, adds TCP framing."""
+    full = build_login_packet(token, open_id, conv_id)
+    game_payload = full[24:]  # strip 24B KCP header → 442 bytes
+    # TCP framing: [4B BE length][payload]
+    tcp_pkt = struct.pack(">I", len(game_payload)) + game_payload
+    return tcp_pkt
+
+
 def http_login(account, password):
     data = f"publisher=688&serverId=1&loginId={account}&password={password}"
     r = requests.post(LOGIN_URL, data=data, headers=HEADERS, timeout=10, verify=False)
@@ -105,26 +116,33 @@ def http_login(account, password):
 
 
 def do_getconv(host, port):
-    """Step 1: Connect → send GetConv → get conv_id → close."""
+    """Connect → send GetConv → get conv_id → close."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(5)
     s.connect((host, port))
-    # GetConv = [4B BE len=2][2B BE opcode=901]
+    # GetConv = [4B BE len=2][2B BE opcode=901] = 6 bytes
     s.sendall(b"\x00\x00\x00\x02\x03\x85")
     print(f"  → GetConv sent (6B)")
-    resp = s.recv(4096)
+    resp = b""
+    try:
+        resp = s.recv(4096)
+    except:
+        pass
     s.close()
-    print(f"  ← Response: {len(resp)}B — {resp.hex()}")
 
-    # Parse: [4B BE len][2B BE opcode=901][body]
+    if not resp:
+        print(f"  ← No response")
+        return None
+
+    print(f"  ← Response: {len(resp)}B — {resp.hex()}")
     if len(resp) >= 6:
         opcode = struct.unpack(">H", resp[4:6])[0]
         body = resp[6:]
         print(f"    Opcode: 0x{opcode:04X} ({CMD_NAMES.get(opcode, '?')})")
         if len(body) >= 4:
-            conv_id = body[0:4]
-            print(f"    ConvID: {conv_id.hex()}")
-            return conv_id
+            cid = body[0:4]
+            print(f"    ConvID: {cid.hex()}")
+            return cid
     return None
 
 
@@ -141,6 +159,7 @@ class Client:
         self.alive = True
 
     def send_raw(self, opcode, body=b""):
+        """Send command with TCP framing: [4B BE len][2B opcode][body]."""
         payload = struct.pack(">H", opcode) + body
         pkt = struct.pack(">I", len(payload)) + payload
         self.sock.sendall(pkt)
@@ -163,7 +182,7 @@ class Client:
                         strs = extract_strings(body[2:])
                         print(f"\n  [{ts}] ← {name} err={err}", end="")
                         if strs:
-                            print(f" \"{strs[0]}\"", end="")
+                            print(f' "{strs[0]}"', end="")
                         print(f" ({len(body)}B)")
                     elif opcode == 900:
                         print(f"\n  [{ts}] ← Pong ({len(body)}B)")
@@ -192,7 +211,7 @@ class Client:
 
 def main():
     print("=" * 48)
-    print("   Aria Headless Client — Termux v2")
+    print("   Aria Headless Client — Termux v3")
     print("=" * 48)
     print("  Commands after login:")
     print("    ping        — keepalive")
@@ -245,7 +264,7 @@ def main():
 
             token = r.get("token", "")
             gs = r.get("gameServer", "")
-            oid = r.get("openId", "")    # ← openId, NOT account!
+            oid = r.get("openId", "")
             rid = r.get("roleId", "")
             print(f"  ✓ Token  : {token[:16]}...")
             print(f"  ✓ Server : {gs}")
@@ -265,8 +284,8 @@ def main():
                 print(f"  ✗ GetConv error: {e}")
                 conv_id = None
 
-            # ── Step 3: TCP Connect + Login ──
-            print(f"  [3] TCP connect + login...")
+            # ── Step 3: TCP Connect ──
+            print(f"  [3] TCP connect...")
             try:
                 if client:
                     client.close()
@@ -278,18 +297,20 @@ def main():
                 print(f"  ✗ {e}")
                 continue
 
-            # Build login packet with openId + conv_id
-            pkt = build_login_packet(token, oid, conv_id)
+            # ── Step 4: Send plain TCP login (446B, no KCP header) ──
+            print(f"  [4] Send plain TCP login...")
+            pkt = build_plain_tcp(token, oid, conv_id)
             try:
                 client.sock.sendall(pkt)
-                print(f"  ✓ Login sent ({len(pkt)}B) [openId={oid}, conv={conv_id.hex() if conv_id else 'default'}]")
+                conv_hex = conv_id.hex() if conv_id else "default"
+                print(f"  ✓ Login sent ({len(pkt)}B) [openId={oid}, conv={conv_hex}]")
             except Exception as e:
                 print(f"  ✗ {e}")
                 continue
 
-            print(f"  [4] Waiting responses...")
+            print(f"  [5] Waiting responses...")
             time.sleep(3)
-            print(f"  [5] Ping...")
+            print(f"  [6] Ping...")
             client.send_raw(900)
             time.sleep(1)
             print(f"\n  ✓ Ready!")
