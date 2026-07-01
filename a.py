@@ -245,7 +245,9 @@ def main():
     print("=" * 48)
 
     c = None
-    acc = pw = tok = gs = oid = ""
+    acc = "8034175"
+    pw = "6tdfsmht"
+    tok = gs = oid = ""
     mode = 3
 
     while True:
@@ -263,10 +265,10 @@ def main():
 
         if cmd in ("login", "again"):
             if cmd == "login":
-                acc = input("  User: ").strip()
-                pw = input("  Pass: ").strip()
-                if not acc or not pw:
-                    print("  ✗ required"); continue
+                u = input(f"  User [{acc}]: ").strip()
+                if u: acc = u
+                p = input(f"  Pass [{pw}]: ").strip()
+                if p: pw = p
                 print("  [1] HTTP login...")
                 try:
                     r = http_login(acc, pw)
