@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aria Debug Client v5 — multi-mode packet send, FlatBuffer error parse"""
+"""Aria Debug Client v6 — test no-token-replace mode"""
 import requests, socket, struct, time, warnings, urllib3, sys, threading
 
 warnings.filterwarnings('ignore')
@@ -17,6 +17,7 @@ CMD = {
     902: "DataEnd", 998: "ErrorStr", 999: "Error", 5601: "Queue", 5602: "Timeout",
 }
 
+# Original 466B template — DO NOT MODIFY unless asked
 TPL = bytes.fromhex(
     "5fc5020051000001d632b5190000000000000000ba0100000064380000000000"
     "000030006000040008000c0010005000140018001c002000240028002c003000"
@@ -34,14 +35,6 @@ TPL = bytes.fromhex(
     "0000324533413736464445454334373241334430334136303835464537464632"
     "423400000000070000003830333431373400"
 )
-
-MODES = {
-    "0": ("raw 466B (full KCP packet)", 0),
-    "1": ("strip 20B (KCP core header)", 20),
-    "2": ("strip 24B (KCP + len field)", 24),
-    "3": ("strip 28B (KCP + len + 4B)", 28),
-    "4": ("strip 24B + no BE framing", 24),
-}
 
 
 def fb_parse_error(body):
@@ -107,36 +100,48 @@ def parse_all(data):
     return results
 
 
-def build_full(token, open_id, conv_id=None):
-    """Build full 466B template with patched fields."""
+def build_login(token, open_id, conv_id, mode):
+    """
+    mode 0: raw 466B, replace token+openId
+    mode 1: strip 20B+BE frame, replace token+openId
+    mode 2: strip 24B+BE frame, replace token+openId
+    mode 3: strip 24B+BE frame, replace ONLY openId (keep original token)
+    mode 4: strip 24B+BE frame, replace ONLY token (keep original openId)
+    mode 5: raw 466B, replace NOTHING (pure template)
+    """
     pkt = bytearray(TPL)
+
+    # conv_id
     if conv_id:
         pkt[0:4] = conv_id
+
+    # timestamp
     ts = int(time.time() * 1000) & 0xFFFFFFFF
     pkt[8:12] = struct.pack("<I", ts)
-    tok = token.upper().encode("ascii")[:32]
-    pkt[418:418+len(tok)] = tok
-    oid = open_id.encode("ascii")
-    pkt[458:458+len(oid)] = oid
-    return bytes(pkt)
 
+    if mode not in (3, 5):
+        # Replace token at offset 418
+        tok = token.upper().encode("ascii")[:32]
+        pkt[418:418+len(tok)] = tok
 
-def build_packet(token, open_id, conv_id, mode):
-    """Build packet based on mode.
-    mode 0: raw 466B
-    mode 1: strip 20B, add BE framing
-    mode 2: strip 24B, add BE framing
-    mode 3: strip 28B, add BE framing
-    mode 4: strip 24B, NO framing (raw payload)
-    """
-    full = build_full(token, open_id, conv_id)
-    if mode == 0:
-        return full
-    strip = {1: 20, 2: 24, 3: 28}[mode] if mode in (1,2,3) else 24
-    payload = full[strip:]
-    if mode == 4:
-        return payload  # no framing
-    return struct.pack(">I", len(payload)) + payload
+    if mode not in (4, 5):
+        # Replace openId at offset 458
+        oid = open_id.encode("ascii")
+        pkt[458:458+len(oid)] = oid
+
+    # Show what's in the packet at key offsets
+    print(f"    [418:450] token = {bytes(pkt[418:450]).decode('ascii', errors='ignore')}")
+    print(f"    [458:466] openId = {bytes(pkt[458:466]).decode('ascii', errors='ignore')}")
+
+    # Strip mode
+    if mode == 0 or mode == 5:
+        return bytes(pkt)  # raw 466B
+    elif mode == 1:
+        payload = pkt[20:]
+        return struct.pack(">I", len(payload)) + payload
+    else:  # mode 2,3,4
+        payload = pkt[24:]
+        return struct.pack(">I", len(payload)) + payload
 
 
 def http_login(user, pw):
@@ -227,20 +232,21 @@ class Conn:
 
 def main():
     print("=" * 48)
-    print("  Aria Debug Client v5")
+    print("  Aria Debug Client v6")
     print("=" * 48)
-    print("  Packet modes (pilih setelah login):")
-    print("    0 = raw 466B (full KCP)")
-    print("    1 = strip 20B + BE frame")
-    print("    2 = strip 24B + BE frame")
-    print("    3 = strip 28B + BE frame")
-    print("    4 = strip 24B no frame")
-    print("  Commands: login/again/ping/items/data/s N/st/q")
+    print("  Modes:")
+    print("    0 = raw 466B, replace token+openId")
+    print("    1 = strip 20B, replace token+openId")
+    print("    2 = strip 24B, replace token+openId")
+    print("    3 = strip 24B, replace ONLY openId")
+    print("    4 = strip 24B, replace ONLY token")
+    print("    5 = raw 466B, replace NOTHING")
+    print("  Cmds: login/again/ping/items/data/s N/st/q")
     print("=" * 48)
 
     c = None
     acc = pw = tok = gs = oid = ""
-    mode = 2  # default
+    mode = 3
 
     while True:
         try:
@@ -255,43 +261,49 @@ def main():
             if c: c.close()
             break
 
-        if cmd == "login":
-            acc = input("  User: ").strip()
-            pw = input("  Pass: ").strip()
-            if not acc or not pw:
-                print("  ✗ required"); continue
-
-            # mode selection
-            m = input("  Mode [0-4, default=2]: ").strip()
-            if m in MODES:
-                mode = int(m)
-            print(f"  Mode: {mode} = {MODES[str(mode)][0]}")
-
-            print("  [1] HTTP login...")
-            try:
-                r = http_login(acc, pw)
-            except Exception as e:
-                print(f"  ✗ {e}"); continue
-            if r.get("status") != 0:
-                print(f"  ✗ {r}"); continue
-
-            tok = r.get("token", "")
-            gs = r.get("gameServer", "")
-            oid = r.get("openId", "")
-            rid = r.get("roleId", "")
-            print(f"  ✓ token  : {tok[:20]}...")
-            print(f"  ✓ server : {gs}")
-            print(f"  ✓ openId : {oid}  roleId: {rid}")
+        if cmd in ("login", "again"):
+            if cmd == "login":
+                acc = input("  User: ").strip()
+                pw = input("  Pass: ").strip()
+                if not acc or not pw:
+                    print("  ✗ required"); continue
+                print("  [1] HTTP login...")
+                try:
+                    r = http_login(acc, pw)
+                except Exception as e:
+                    print(f"  ✗ {e}"); continue
+                if r.get("status") != 0:
+                    print(f"  ✗ {r}"); continue
+                tok = r.get("token", "")
+                gs = r.get("gameServer", "")
+                oid = r.get("openId", "")
+                rid = r.get("roleId", "")
+                print(f"  ✓ token  : {tok[:20]}...")
+                print(f"  ✓ server : {gs}")
+                print(f"  ✓ openId : {oid}  roleId: {rid}")
 
             if ":" not in gs:
-                print(f"  ✗ bad server"); continue
+                print("  ✗ login first"); continue
+
+            m = input("  Mode [0-5, default=3]: ").strip()
+            if m in ("0","1","2","3","4","5"):
+                mode = int(m)
+            print(f"  Mode: {mode}")
+
             host, port = gs.split(":")
 
-            print("  [2] GetConv...")
-            try:
-                conv = do_getconv(host, int(port))
-            except Exception as e:
-                print(f"  ✗ {e}"); conv = None
+            if cmd == "login":
+                print("  [2] GetConv...")
+                try:
+                    conv = do_getconv(host, int(port))
+                except Exception as e:
+                    print(f"  ✗ {e}"); conv = None
+            else:
+                # again — re-getconv
+                try:
+                    conv = do_getconv(host, int(port))
+                except Exception as e:
+                    print(f"  ✗ {e}"); conv = None
 
             print("  [3] TCP connect...")
             try:
@@ -303,48 +315,16 @@ def main():
                 print(f"  ✗ {e}"); continue
 
             print(f"  [4] Send login (mode {mode})...")
-            pkt = build_packet(tok, oid, conv, mode)
+            pkt = build_login(tok, oid, conv, mode)
             try:
                 c.sock.sendall(pkt)
-                print(f"  ✓ sent {len(pkt)}B  [openId={oid} conv={conv.hex() if conv else '?'}]")
-                print(f"  first 16: {pkt[:16].hex()}")
+                print(f"  ✓ sent {len(pkt)}B")
+                print(f"  first 24: {pkt[:24].hex()}")
             except Exception as e:
                 print(f"  ✗ {e}"); continue
 
             time.sleep(3)
             print("  [5] Ping...")
-            c.send(900)
-            time.sleep(1)
-            print("\n  ✓ Ready")
-
-        elif cmd == "again":
-            """Resend login packet with different mode without re-logging HTTP."""
-            if not tok or not gs:
-                print("  ✗ login first"); continue
-            m = input("  Mode [0-4]: ").strip()
-            if m not in MODES:
-                print("  ✗ 0-4"); continue
-            mode = int(m)
-            host, port = gs.split(":")
-
-            print(f"  Resend with mode {mode}: {MODES[str(mode)][0]}")
-            try:
-                if c: c.close()
-                c = Conn(host, int(port))
-                c.connect()
-                threading.Thread(target=c.recv_loop, daemon=True).start()
-            except Exception as e:
-                print(f"  ✗ {e}"); continue
-
-            conv = do_getconv(host, int(port))
-            pkt = build_packet(tok, oid, conv, mode)
-            try:
-                c.sock.sendall(pkt)
-                print(f"  ✓ sent {len(pkt)}B  first 16: {pkt[:16].hex()}")
-            except Exception as e:
-                print(f"  ✗ {e}"); continue
-
-            time.sleep(3)
             c.send(900)
             time.sleep(1)
             print("\n  ✓ Ready")
