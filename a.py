@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aria Debug Client v4.1 — FlatBuffer-aware error parsing"""
+"""Aria Debug Client v5 — multi-mode packet send, FlatBuffer error parse"""
 import requests, socket, struct, time, warnings, urllib3, sys, threading
 
 warnings.filterwarnings('ignore')
@@ -35,10 +35,16 @@ TPL = bytes.fromhex(
     "423400000000070000003830333431373400"
 )
 
+MODES = {
+    "0": ("raw 466B (full KCP packet)", 0),
+    "1": ("strip 20B (KCP core header)", 20),
+    "2": ("strip 24B (KCP + len field)", 24),
+    "3": ("strip 28B (KCP + len + 4B)", 28),
+    "4": ("strip 24B + no BE framing", 24),
+}
 
-# ── FlatBuffer parser ──
+
 def fb_parse_error(body):
-    """Parse ErrorMessage FlatBuffer → (cmd, error_code, extra_strings)"""
     if len(body) < 8:
         return None, None, []
     try:
@@ -101,7 +107,8 @@ def parse_all(data):
     return results
 
 
-def build_login(token, open_id, conv_id=None):
+def build_full(token, open_id, conv_id=None):
+    """Build full 466B template with patched fields."""
     pkt = bytearray(TPL)
     if conv_id:
         pkt[0:4] = conv_id
@@ -114,9 +121,21 @@ def build_login(token, open_id, conv_id=None):
     return bytes(pkt)
 
 
-def build_plain(token, open_id, conv_id=None):
-    full = build_login(token, open_id, conv_id)
-    payload = full[24:]
+def build_packet(token, open_id, conv_id, mode):
+    """Build packet based on mode.
+    mode 0: raw 466B
+    mode 1: strip 20B, add BE framing
+    mode 2: strip 24B, add BE framing
+    mode 3: strip 28B, add BE framing
+    mode 4: strip 24B, NO framing (raw payload)
+    """
+    full = build_full(token, open_id, conv_id)
+    if mode == 0:
+        return full
+    strip = {1: 20, 2: 24, 3: 28}[mode] if mode in (1,2,3) else 24
+    payload = full[strip:]
+    if mode == 4:
+        return payload  # no framing
     return struct.pack(">I", len(payload)) + payload
 
 
@@ -176,18 +195,19 @@ class Conn:
                     ts = time.strftime("%H:%M:%S")
                     print(f"\n  [{ts}] ← {name} (0x{opcode:04X}) len={length} body={len(body)}B")
                     hexdump(body)
-
-                    if opcode == 999:  # Error — parse FlatBuffer
+                    if opcode == 999:
                         cmd, err, strs = fb_parse_error(body)
                         cmd_name = CMD.get(cmd, f"0x{cmd:04X}") if cmd else "?"
-                        print(f"    >>> ERROR: cmd={cmd_name}({cmd}) errCode={err} (0x{err:04X}) <<<" if err else "    >>> ERROR (parse failed) <<<")
+                        if err is not None:
+                            print(f"    >>> ERROR: cmd={cmd_name}({cmd}) errCode={err} (0x{err:04X}) <<<")
+                        else:
+                            print(f"    >>> ERROR (parse failed) <<<")
                         if strs:
                             print(f"    strings: {strs}")
                     else:
                         strs = extract_strings(body)
                         if strs:
                             print(f"    strings: {strs}")
-
                     sys.stdout.write("\n> ")
                     sys.stdout.flush()
             except socket.timeout:
@@ -206,11 +226,21 @@ class Conn:
 
 
 def main():
-    print("=" * 44)
-    print("  Aria Debug Client v4.1")
-    print("=" * 44)
+    print("=" * 48)
+    print("  Aria Debug Client v5")
+    print("=" * 48)
+    print("  Packet modes (pilih setelah login):")
+    print("    0 = raw 466B (full KCP)")
+    print("    1 = strip 20B + BE frame")
+    print("    2 = strip 24B + BE frame")
+    print("    3 = strip 28B + BE frame")
+    print("    4 = strip 24B no frame")
+    print("  Commands: login/again/ping/items/data/s N/st/q")
+    print("=" * 48)
+
     c = None
-    acc = ""
+    acc = pw = tok = gs = oid = ""
+    mode = 2  # default
 
     while True:
         try:
@@ -230,6 +260,12 @@ def main():
             pw = input("  Pass: ").strip()
             if not acc or not pw:
                 print("  ✗ required"); continue
+
+            # mode selection
+            m = input("  Mode [0-4, default=2]: ").strip()
+            if m in MODES:
+                mode = int(m)
+            print(f"  Mode: {mode} = {MODES[str(mode)][0]}")
 
             print("  [1] HTTP login...")
             try:
@@ -266,16 +302,49 @@ def main():
             except Exception as e:
                 print(f"  ✗ {e}"); continue
 
-            print("  [4] Plain TCP login...")
-            pkt = build_plain(tok, oid, conv)
+            print(f"  [4] Send login (mode {mode})...")
+            pkt = build_packet(tok, oid, conv, mode)
             try:
                 c.sock.sendall(pkt)
                 print(f"  ✓ sent {len(pkt)}B  [openId={oid} conv={conv.hex() if conv else '?'}]")
+                print(f"  first 16: {pkt[:16].hex()}")
             except Exception as e:
                 print(f"  ✗ {e}"); continue
 
             time.sleep(3)
             print("  [5] Ping...")
+            c.send(900)
+            time.sleep(1)
+            print("\n  ✓ Ready")
+
+        elif cmd == "again":
+            """Resend login packet with different mode without re-logging HTTP."""
+            if not tok or not gs:
+                print("  ✗ login first"); continue
+            m = input("  Mode [0-4]: ").strip()
+            if m not in MODES:
+                print("  ✗ 0-4"); continue
+            mode = int(m)
+            host, port = gs.split(":")
+
+            print(f"  Resend with mode {mode}: {MODES[str(mode)][0]}")
+            try:
+                if c: c.close()
+                c = Conn(host, int(port))
+                c.connect()
+                threading.Thread(target=c.recv_loop, daemon=True).start()
+            except Exception as e:
+                print(f"  ✗ {e}"); continue
+
+            conv = do_getconv(host, int(port))
+            pkt = build_packet(tok, oid, conv, mode)
+            try:
+                c.sock.sendall(pkt)
+                print(f"  ✓ sent {len(pkt)}B  first 16: {pkt[:16].hex()}")
+            except Exception as e:
+                print(f"  ✗ {e}"); continue
+
+            time.sleep(3)
             c.send(900)
             time.sleep(1)
             print("\n  ✓ Ready")
@@ -299,7 +368,7 @@ def main():
             else: print("  ✗ offline")
 
         elif cmd == "st":
-            if c and c.alive: print(f"  ✓ {c.host}:{c.port} | {acc}")
+            if c and c.alive: print(f"  ✓ {c.host}:{c.port} | {acc} mode={mode}")
             else: print("  ✗ offline")
 
         else:
@@ -307,7 +376,7 @@ def main():
                 if c and c.alive: c.send(int(cmd))
                 else: print("  ✗ offline")
             except ValueError:
-                print("  login/ping/items/data/s <N>/st/q")
+                print("  login/again/ping/items/data/s N/st/q")
 
 
 if __name__ == "__main__":
