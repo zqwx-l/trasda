@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aria Debug Client v6 — test no-token-replace mode"""
+"""Aria Headless Client v9 — replace-based patching + timestamp fix"""
 import requests, socket, struct, time, warnings, urllib3, sys, threading
 
 warnings.filterwarnings('ignore')
@@ -12,13 +12,12 @@ HEADERS = {
     "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 16; Infinix X6858)",
 }
 
-CMD = {
+CMD_NAMES = {
     100: "Login", 111: "GetItems", 900: "Ping", 901: "GetConv",
-    902: "DataEnd", 998: "ErrorStr", 999: "Error", 5601: "Queue", 5602: "Timeout",
+    902: "DataEnd", 999: "Error", 5601: "Queue", 5602: "Timeout",
 }
 
-# Original 466B template — DO NOT MODIFY unless asked
-TPL = bytes.fromhex(
+LOGIN_TEMPLATE = bytes.fromhex(
     "5fc5020051000001d632b5190000000000000000ba0100000064380000000000"
     "000030006000040008000c0010005000140018001c002000240028002c003000"
     "0000340038003c0058004000440048004c0030000000b0020000010000006801"
@@ -37,56 +36,21 @@ TPL = bytes.fromhex(
 )
 
 
-def fb_parse_error(body):
-    if len(body) < 8:
-        return None, None, []
-    try:
-        root_off = struct.unpack_from("<i", body, 0)[0]
-        if root_off < 0 or root_off + 4 > len(body):
-            return None, None, []
-        soffset = struct.unpack_from("<i", body, root_off)[0]
-        vtable_off = root_off - soffset
-        if vtable_off < 0 or vtable_off + 4 > len(body):
-            return None, None, []
-        vt_size = struct.unpack_from("<H", body, vtable_off)[0]
-        fields = []
-        for i in range(2, vt_size // 2):
-            if vtable_off + i * 2 + 2 > len(body):
-                break
-            fields.append(struct.unpack_from("<H", body, vtable_off + i * 2)[0])
-        cmd = err = None
-        if len(fields) > 0 and fields[0] > 0 and root_off + fields[0] + 2 <= len(body):
-            cmd = struct.unpack_from("<H", body, root_off + fields[0])[0]
-        if len(fields) > 1 and fields[1] > 0 and root_off + fields[1] + 4 <= len(body):
-            err = struct.unpack_from("<i", body, root_off + fields[1])[0]
-        return cmd, err, extract_strings(body)
-    except Exception:
-        return None, None, []
-
-
-def hexdump(data, prefix="    "):
-    for i in range(0, len(data), 16):
-        chunk = data[i:i+16]
-        hx = " ".join(f"{b:02x}" for b in chunk)
-        asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
-        print(f"{prefix}{i:04x}  {hx:<48s}  {asc}")
-
-
 def extract_strings(data):
     out, cur = [], b""
     for b in data:
         if 32 <= b < 127:
             cur += bytes([b])
         else:
-            if len(cur) >= 3:
+            if len(cur) >= 4:
                 out.append(cur.decode("ascii", errors="ignore"))
             cur = b""
-    if len(cur) >= 3:
+    if len(cur) >= 4:
         out.append(cur.decode("ascii", errors="ignore"))
     return out
 
 
-def parse_all(data):
+def parse_responses(data):
     results, off = [], 0
     while off + 6 <= len(data):
         length = struct.unpack(">I", data[off:off+4])[0]
@@ -100,52 +64,48 @@ def parse_all(data):
     return results
 
 
-def build_login(token, open_id, conv_id, mode):
-    """
-    mode 0: raw 466B, replace token+openId
-    mode 1: strip 20B+BE frame, replace token+openId
-    mode 2: strip 24B+BE frame, replace token+openId
-    mode 3: strip 24B+BE frame, replace ONLY openId (keep original token)
-    mode 4: strip 24B+BE frame, replace ONLY token (keep original openId)
-    mode 5: raw 466B, replace NOTHING (pure template)
-    """
-    pkt = bytearray(TPL)
+def build_login_packet(token, open_id):
+    pkt_bytes = bytes(LOGIN_TEMPLATE)
 
-    # conv_id
-    if conv_id:
-        pkt[0:4] = conv_id
+    # 1. Patch Token (Uppercase string in template)
+    old_token = b"2E3A76FDEEC472A3D03A6085FE7FF2B4"
+    new_token = token.upper().encode("ascii")[:32]
+    if old_token in pkt_bytes:
+        pkt_bytes = pkt_bytes.replace(old_token, new_token)
+        print(f"    [token] replaced")
+    else:
+        print(f"    [!] token not found in template")
 
-    # timestamp
-    ts = int(time.time() * 1000) & 0xFFFFFFFF
-    pkt[8:12] = struct.pack("<I", ts)
+    # 2. Patch OpenID
+    old_openid = b"8034174"
+    new_openid = str(open_id).encode("ascii")
+    if len(new_openid) == len(old_openid) and old_openid in pkt_bytes:
+        pkt_bytes = pkt_bytes.replace(old_openid, new_openid)
+        print(f"    [openId] replaced: {open_id}")
+    else:
+        print(f"    [!] openId mismatch (len {len(new_openid)} vs {len(old_openid)})")
 
-    if mode not in (3, 5):
-        # Replace token at offset 418
-        tok = token.upper().encode("ascii")[:32]
-        pkt[418:418+len(tok)] = tok
+    # 3. Patch Hidden Timestamp (Int64 LE at offset 0x8A = byte 138)
+    old_ts = b"\x61\x34\xb5\x19\x9f\x01\x00\x00"
+    current_ms = int(time.time() * 1000)
+    new_ts = struct.pack("<Q", current_ms)
+    if old_ts in pkt_bytes:
+        pkt_bytes = pkt_bytes.replace(old_ts, new_ts)
+        print(f"    [timestamp] replaced: {current_ms}")
+    else:
+        print(f"    [!] timestamp not found")
 
-    if mode not in (4, 5):
-        # Replace openId at offset 458
-        oid = open_id.encode("ascii")
-        pkt[458:458+len(oid)] = oid
-
-    # Show what's in the packet at key offsets
-    print(f"    [418:450] token = {bytes(pkt[418:450]).decode('ascii', errors='ignore')}")
-    print(f"    [458:466] openId = {bytes(pkt[458:466]).decode('ascii', errors='ignore')}")
-
-    # Strip mode
-    if mode == 0 or mode == 5:
-        return bytes(pkt)  # raw 466B
-    elif mode == 1:
-        payload = pkt[20:]
-        return struct.pack(">I", len(payload)) + payload
-    else:  # mode 2,3,4
-        payload = pkt[24:]
-        return struct.pack(">I", len(payload)) + payload
+    return pkt_bytes
 
 
-def http_login(user, pw):
-    data = f"publisher=688&serverId=1&loginId={user}&password={pw}"
+def build_plain_tcp(token, open_id):
+    full = build_login_packet(token, open_id)
+    payload = full[24:]  # strip KCP header
+    return struct.pack(">I", len(payload)) + payload
+
+
+def http_login(account, password):
+    data = f"publisher=688&serverId=1&loginId={account}&password={password}"
     return requests.post(LOGIN_URL, data=data, headers=HEADERS, timeout=10, verify=False).json()
 
 
@@ -157,18 +117,14 @@ def do_getconv(host, port):
     print("  → GetConv (6B)")
     resp = s.recv(4096)
     s.close()
-    print(f"  ← {len(resp)}B")
-    hexdump(resp)
     if len(resp) >= 10:
-        body = resp[6:]
-        if len(body) >= 4:
-            cid = body[0:4]
-            print(f"  ConvID = {cid.hex()}")
-            return cid
+        cid = resp[6:10]
+        print(f"  ← ConvID = {cid.hex()}")
+        return cid
     return None
 
 
-class Conn:
+class Client:
     def __init__(self, host, port):
         self.host, self.port = host, port
         self.sock = None
@@ -180,14 +136,14 @@ class Conn:
         self.sock.connect((self.host, self.port))
         self.alive = True
 
-    def send(self, opcode, body=b""):
+    def send_raw(self, opcode, body=b""):
         payload = struct.pack(">H", opcode) + body
         pkt = struct.pack(">I", len(payload)) + payload
         self.sock.sendall(pkt)
-        name = CMD.get(opcode, f"0x{opcode:04X}")
+        name = CMD_NAMES.get(opcode, f"0x{opcode:04X}")
         print(f"  → {name} ({len(pkt)}B)")
 
-    def recv_loop(self):
+    def recv_forever(self):
         while self.alive:
             try:
                 data = self.sock.recv(65536)
@@ -195,24 +151,18 @@ class Conn:
                     print("\n  ✗ Disconnected")
                     self.alive = False
                     break
-                for length, opcode, body in parse_all(data):
-                    name = CMD.get(opcode, f"0x{opcode:04X}")
+                for length, opcode, body in parse_responses(data):
+                    name = CMD_NAMES.get(opcode, f"0x{opcode:04X}")
                     ts = time.strftime("%H:%M:%S")
-                    print(f"\n  [{ts}] ← {name} (0x{opcode:04X}) len={length} body={len(body)}B")
-                    hexdump(body)
-                    if opcode == 999:
-                        cmd, err, strs = fb_parse_error(body)
-                        cmd_name = CMD.get(cmd, f"0x{cmd:04X}") if cmd else "?"
-                        if err is not None:
-                            print(f"    >>> ERROR: cmd={cmd_name}({cmd}) errCode={err} (0x{err:04X}) <<<")
-                        else:
-                            print(f"    >>> ERROR (parse failed) <<<")
-                        if strs:
-                            print(f"    strings: {strs}")
+                    if opcode == 999 and len(body) >= 20:
+                        err = struct.unpack("<I", body[16:20])[0]
+                        print(f"\n  [{ts}] ← {name} err={err} ({len(body)}B)")
+                    elif opcode == 900:
+                        print(f"\n  [{ts}] ← Pong ({len(body)}B)")
                     else:
                         strs = extract_strings(body)
-                        if strs:
-                            print(f"    strings: {strs}")
+                        extra = f' "{strs[0]}"' if strs else ""
+                        print(f"\n  [{ts}] ← {name} (0x{opcode:04X}){extra} ({len(body)}B)")
                     sys.stdout.write("\n> ")
                     sys.stdout.flush()
             except socket.timeout:
@@ -226,139 +176,134 @@ class Conn:
     def close(self):
         self.alive = False
         if self.sock:
-            try: self.sock.close()
-            except: pass
+            try:
+                self.sock.close()
+            except:
+                pass
 
 
 def main():
     print("=" * 48)
-    print("  Aria Debug Client v6")
-    print("=" * 48)
-    print("  Modes:")
-    print("    0 = raw 466B, replace token+openId")
-    print("    1 = strip 20B, replace token+openId")
-    print("    2 = strip 24B, replace token+openId")
-    print("    3 = strip 24B, replace ONLY openId")
-    print("    4 = strip 24B, replace ONLY token")
-    print("    5 = raw 466B, replace NOTHING")
-    print("  Cmds: login/again/ping/items/data/s N/st/q")
+    print("  Aria Headless Client v9")
     print("=" * 48)
 
-    c = None
-    acc = "8034175"
-    pw = "6tdfsmht"
-    tok = gs = oid = ""
-    mode = 3
+    client = None
+    account = ""
 
     while True:
         try:
             cmd = input("\n> ").strip().lower()
         except (EOFError, KeyboardInterrupt):
-            if c: c.close()
+            if client:
+                client.close()
+            print("\nBye!")
             break
         if not cmd:
             continue
 
-        if cmd in ("q", "quit", "exit"):
-            if c: c.close()
+        if cmd in ("quit", "exit", "q"):
+            if client:
+                client.close()
+            print("Bye!")
             break
 
-        if cmd in ("login", "again"):
-            if cmd == "login":
-                u = input(f"  User [{acc}]: ").strip()
-                if u: acc = u
-                p = input(f"  Pass [{pw}]: ").strip()
-                if p: pw = p
-                print("  [1] HTTP login...")
-                try:
-                    r = http_login(acc, pw)
-                except Exception as e:
-                    print(f"  ✗ {e}"); continue
-                if r.get("status") != 0:
-                    print(f"  ✗ {r}"); continue
-                tok = r.get("token", "")
-                gs = r.get("gameServer", "")
-                oid = r.get("openId", "")
-                rid = r.get("roleId", "")
-                print(f"  ✓ token  : {tok[:20]}...")
-                print(f"  ✓ server : {gs}")
-                print(f"  ✓ openId : {oid}  roleId: {rid}")
+        if cmd == "login":
+            account = input("  Username: ").strip()
+            password = input("  Password: ").strip()
+            if not account or not password:
+                print("  ✗ Required")
+                continue
+
+            print("  [1] HTTP login...")
+            try:
+                r = http_login(account, password)
+            except Exception as e:
+                print(f"  ✗ {e}")
+                continue
+            if r.get("status") != 0:
+                print(f"  ✗ Failed: {r}")
+                continue
+
+            token = r.get("token", "")
+            gs = r.get("gameServer", "")
+            oid = str(r.get("openId", ""))
+            print(f"  ✓ Token  : {token[:16]}...")
+            print(f"  ✓ Server : {gs}")
+            print(f"  ✓ OpenID : {oid}")
 
             if ":" not in gs:
-                print("  ✗ login first"); continue
-
-            m = input("  Mode [0-5, default=3]: ").strip()
-            if m in ("0","1","2","3","4","5"):
-                mode = int(m)
-            print(f"  Mode: {mode}")
-
+                print(f"  ✗ Bad server")
+                continue
             host, port = gs.split(":")
 
-            if cmd == "login":
-                print("  [2] GetConv...")
-                try:
-                    conv = do_getconv(host, int(port))
-                except Exception as e:
-                    print(f"  ✗ {e}"); conv = None
-            else:
-                # again — re-getconv
-                try:
-                    conv = do_getconv(host, int(port))
-                except Exception as e:
-                    print(f"  ✗ {e}"); conv = None
+            print("  [2] GetConv...")
+            try:
+                conv = do_getconv(host, int(port))
+            except Exception as e:
+                print(f"  ✗ {e}")
+                conv = None
 
             print("  [3] TCP connect...")
             try:
-                if c: c.close()
-                c = Conn(host, int(port))
-                c.connect()
-                threading.Thread(target=c.recv_loop, daemon=True).start()
+                if client:
+                    client.close()
+                client = Client(host, int(port))
+                client.connect()
+                threading.Thread(target=client.recv_forever, daemon=True).start()
             except Exception as e:
-                print(f"  ✗ {e}"); continue
+                print(f"  ✗ {e}")
+                continue
 
-            print(f"  [4] Send login (mode {mode})...")
-            pkt = build_login(tok, oid, conv, mode)
+            print("  [4] Send login...")
+            pkt = build_plain_tcp(token, oid)
             try:
-                c.sock.sendall(pkt)
-                print(f"  ✓ sent {len(pkt)}B")
-                print(f"  first 24: {pkt[:24].hex()}")
+                client.sock.sendall(pkt)
+                print(f"  ✓ Sent {len(pkt)}B")
             except Exception as e:
-                print(f"  ✗ {e}"); continue
+                print(f"  ✗ {e}")
+                continue
 
             time.sleep(3)
             print("  [5] Ping...")
-            c.send(900)
+            client.send_raw(900)
             time.sleep(1)
             print("\n  ✓ Ready")
 
         elif cmd == "ping":
-            if c and c.alive: c.send(900)
-            else: print("  ✗ offline")
+            if client and client.alive:
+                client.send_raw(900)
+            else:
+                print("  ✗ offline")
 
         elif cmd == "items":
-            if c and c.alive: c.send(111)
-            else: print("  ✗ offline")
+            if client and client.alive:
+                client.send_raw(111)
+            else:
+                print("  ✗ offline")
 
-        elif cmd == "data":
-            if c and c.alive: c.send(902)
-            else: print("  ✗ offline")
+        elif cmd.startswith("send "):
+            if client and client.alive:
+                try:
+                    client.send_raw(int(cmd.split()[1]))
+                except:
+                    print("  ✗ send <opcode>")
+            else:
+                print("  ✗ offline")
 
-        elif cmd.startswith("s "):
-            if c and c.alive:
-                try: c.send(int(cmd.split()[1]))
-                except: print("  ✗ s <opcode>")
-            else: print("  ✗ offline")
-
-        elif cmd == "st":
-            if c and c.alive: print(f"  ✓ {c.host}:{c.port} | {acc} mode={mode}")
-            else: print("  ✗ offline")
+        elif cmd == "status":
+            if client and client.alive:
+                print(f"  ✓ {client.host}:{client.port} | {account}")
+            else:
+                print("  ✗ offline")
 
         else:
             try:
-                if c and c.alive: c.send(int(cmd))
-                else: print("  ✗ offline")
+                if client and client.alive:
+                    client.send_raw(int(cmd))
+                else:
+                    print("  ✗ offline")
             except ValueError:
-                print("  login/again/ping/items/data/s N/st/q")
+                print("  login/ping/items/send N/status/q")
 
 
 if __name__ == "__main__":
