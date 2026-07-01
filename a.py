@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aria Debug Client v4 — full hex dump, short name"""
+"""Aria Debug Client v4.1 — FlatBuffer-aware error parsing"""
 import requests, socket, struct, time, warnings, urllib3, sys, threading
 
 warnings.filterwarnings('ignore')
@@ -34,6 +34,35 @@ TPL = bytes.fromhex(
     "0000324533413736464445454334373241334430334136303835464537464632"
     "423400000000070000003830333431373400"
 )
+
+
+# ── FlatBuffer parser ──
+def fb_parse_error(body):
+    """Parse ErrorMessage FlatBuffer → (cmd, error_code, extra_strings)"""
+    if len(body) < 8:
+        return None, None, []
+    try:
+        root_off = struct.unpack_from("<i", body, 0)[0]
+        if root_off < 0 or root_off + 4 > len(body):
+            return None, None, []
+        soffset = struct.unpack_from("<i", body, root_off)[0]
+        vtable_off = root_off - soffset
+        if vtable_off < 0 or vtable_off + 4 > len(body):
+            return None, None, []
+        vt_size = struct.unpack_from("<H", body, vtable_off)[0]
+        fields = []
+        for i in range(2, vt_size // 2):
+            if vtable_off + i * 2 + 2 > len(body):
+                break
+            fields.append(struct.unpack_from("<H", body, vtable_off + i * 2)[0])
+        cmd = err = None
+        if len(fields) > 0 and fields[0] > 0 and root_off + fields[0] + 2 <= len(body):
+            cmd = struct.unpack_from("<H", body, root_off + fields[0])[0]
+        if len(fields) > 1 and fields[1] > 0 and root_off + fields[1] + 4 <= len(body):
+            err = struct.unpack_from("<i", body, root_off + fields[1])[0]
+        return cmd, err, extract_strings(body)
+    except Exception:
+        return None, None, []
 
 
 def hexdump(data, prefix="    "):
@@ -87,7 +116,7 @@ def build_login(token, open_id, conv_id=None):
 
 def build_plain(token, open_id, conv_id=None):
     full = build_login(token, open_id, conv_id)
-    payload = full[24:]  # strip KCP header
+    payload = full[24:]
     return struct.pack(">I", len(payload)) + payload
 
 
@@ -147,12 +176,18 @@ class Conn:
                     ts = time.strftime("%H:%M:%S")
                     print(f"\n  [{ts}] ← {name} (0x{opcode:04X}) len={length} body={len(body)}B")
                     hexdump(body)
-                    strs = extract_strings(body)
-                    if strs:
-                        print(f"    strings: {strs}")
-                    if opcode == 999 and len(body) >= 2:
-                        err = struct.unpack(">H", body[0:2])[0]
-                        print(f"    >>> ERROR CODE: {err} (0x{err:04X}) <<<")
+
+                    if opcode == 999:  # Error — parse FlatBuffer
+                        cmd, err, strs = fb_parse_error(body)
+                        cmd_name = CMD.get(cmd, f"0x{cmd:04X}") if cmd else "?"
+                        print(f"    >>> ERROR: cmd={cmd_name}({cmd}) errCode={err} (0x{err:04X}) <<<" if err else "    >>> ERROR (parse failed) <<<")
+                        if strs:
+                            print(f"    strings: {strs}")
+                    else:
+                        strs = extract_strings(body)
+                        if strs:
+                            print(f"    strings: {strs}")
+
                     sys.stdout.write("\n> ")
                     sys.stdout.flush()
             except socket.timeout:
@@ -172,7 +207,7 @@ class Conn:
 
 def main():
     print("=" * 44)
-    print("  Aria Debug Client v4")
+    print("  Aria Debug Client v4.1")
     print("=" * 44)
     c = None
     acc = ""
