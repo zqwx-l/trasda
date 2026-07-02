@@ -60,6 +60,7 @@ class AriaClient:
         self.sock = None
         self.token = None
         self.role_id = None
+        self.http_info = {}
         self.login_id = None
         self.password = None
         self.connected = False
@@ -80,6 +81,7 @@ class AriaClient:
         info = resp.json()
         self.token = info.get("token", "")
         self.role_id = int(info.get("roleId", 0))
+        self.http_info = info
         print(f"[+] Token: {self.token}")
         print(f"[+] RoleId: {self.role_id}")
         return info
@@ -154,28 +156,42 @@ class AriaClient:
             o = struct.unpack_from('<H', pkt, vpos + 4 + idx * 2)[0]
             return tpos + o if o else None
 
-        # Patch Token (field 3)
-        a = field_abs(3)
-        r = struct.unpack_from('<i', pkt, a)[0]
-        s = a + r
-        n = struct.unpack_from('<I', pkt, s)[0]
-        old = pkt[s+4:s+4+n].decode()
-        t = self.token[:n].ljust(n, '0')
-        pkt[s+4:s+4+n] = t.encode()
-        print(f"  Token: {old[:16]}... -> {t[:16]}...")
+        def patch_string(idx, new_val):
+            """Patch a FlatBuffer string field (pad/truncate to original length)"""
+            a = field_abs(idx)
+            if not a: return None
+            r = struct.unpack_from('<i', pkt, a)[0]
+            s = a + r
+            n = struct.unpack_from('<I', pkt, s)[0]
+            old = pkt[s+4:s+4+n].decode()
+            padded = new_val[:n].ljust(n, '\x00')
+            pkt[s+4:s+4+n] = padded.encode()
+            return old
 
-        # Patch Time (field 4)
-        a = field_abs(4)
-        if a:
-            ms = int(time.time() * 1000)
-            struct.pack_into('<q', pkt, a, ms)
-            print(f"  Time: {ms}")
+        def patch_long(idx, new_val):
+            """Patch a FlatBuffer long (int64) field"""
+            a = field_abs(idx)
+            if not a: return None
+            old = struct.unpack_from('<q', pkt, a)[0]
+            struct.pack_into('<q', pkt, a, new_val)
+            return old
+
+        # Patch Loginid (field 2) - MUST match token's account
+        old_id = patch_string(2, self.login_id)
+        print(f"  Loginid: '{old_id}' -> '{self.login_id}'")
+
+        # Patch Token (field 3)
+        old_t = patch_string(3, self.token)
+        print(f"  Token: {old_t[:16]}... -> {self.token[:16]}...")
+
+        # Patch Time (field 4) - use server time
+        http_time = int(self.http_info.get('time', time.time() * 1000))
+        old_time = patch_long(4, http_time)
+        print(f"  Time: {old_time} -> {http_time}")
 
         # Patch RoleId (field 17)
-        a = field_abs(17)
-        if a:
-            struct.pack_into('<q', pkt, a, self.role_id)
-            print(f"  RoleId: {self.role_id}")
+        old_role = patch_long(17, self.role_id)
+        print(f"  RoleId: {old_role} -> {self.role_id}")
 
         # Read init
         print("[*] Reading server init...")
@@ -200,20 +216,23 @@ class AriaClient:
             if cmd is not None:
                 name = CMD_NAMES.get(cmd, f"CMD_{cmd}")
                 elapsed = int(time.time() - start)
-                print(f"  [{elapsed}s] <- {name} (cmd={cmd}) len={len(body)} hex={body[:40].hex()}")
+                payload_hex = body[4:].hex() if len(body) > 4 else ""
+                e1009 = " ← E1009!" if "f103" in payload_hex else ""
+                print(f"  [{elapsed}s] <- {name} (cmd={cmd}) len={len(body)}{e1009}")
                 self.responses.append(("login_resp", cmd, body))
                 self.last_response = body
-                if cmd == 900:
-                    print(f"[+] Server is alive (got Pong)")
-                if cmd not in [900, 999]:
+                if cmd == 100:
                     self.logged_in = True
+                    print(f"[+] Login confirmed (cmd=100 response)")
+                elif "f103" in payload_hex:
+                    print(f"[!] E1009 detected - login rejected")
             else:
                 break
 
         if self.logged_in:
             print("[+] Login successful! Session active.")
         else:
-            print("[?] Login sent, waiting for more data...")
+            print("[!] Login may have failed. Check responses above.")
 
     def do_ping(self):
         """Send ping"""
