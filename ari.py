@@ -273,54 +273,68 @@ class AriaClient:
             self._decode_role_info(body)
 
     def _decode_role_info(self, body):
-        """Decode cmd=104 GetRoleInfo response"""
-        fb = body[4:]  # skip cmd+flags
-        if len(fb) < 8:
-            return
-        fields = [
-            (1, "RoleId", "long"), (2, "Name", "string"), (3, "Level", "int"),
-            (4, "Exp", "long"), (5, "Gender", "int"), (6, "Gold", "long"),
-            (7, "Diamond", "long"), (8, "BindDiamond", "long"),
-            (9, "ScrollTicket", "long"), (10, "Prelude", "int"),
-            (11, "SymbolCard", "int"), (12, "Greetings", "string"),
-            (15, "CreateDate", "string"), (16, "GuildName", "string"),
-            (19, "MainCityId", "int"), (21, "FishNum", "int"),
-            (22, "GuildId", "long"), (23, "Birthday", "string"),
-        ]
-        try:
-            root = struct.unpack_from('<I', fb, 0)[0]
-            tpos = root
-            soff = struct.unpack_from('<i', fb, tpos)[0]
-            vpos = tpos - soff
-            vsize = struct.unpack_from('<H', fb, vpos)[0]
-            num_fields = (vsize - 4) // 2
-            print("\n  === CHARACTER INFO ===")
-            for idx, name, ftype in fields:
-                if idx >= num_fields:
+        """Decode cmd=104 GetRoleInfo response — hexdump + attempt FlatBuffer decode"""
+        fb = body[4:]  # skip cmd(2)+flags(2)
+        print(f"\n  === CMD=104 RAW ({len(fb)}B) ===")
+        for i in range(0, min(len(fb), 512), 16):
+            chunk = fb[i:i+16]
+            hx = ' '.join(f'{b:02x}' for b in chunk)
+            asc = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+            print(f"    {i:04x}: {hx:<48s} {asc}")
+        if len(fb) > 512:
+            print(f"    ... ({len(fb)-512} more bytes)")
+        print("  =================================\n")
+
+        # Also try raw FlatBuffer with different skip amounts
+        for skip in [0, 2, 4, 6]:
+            data = body[skip:]
+            if len(data) < 8:
+                continue
+            try:
+                root = struct.unpack_from('<I', data, 0)[0]
+                if root > len(data) or root < 4:
                     continue
-                voff = struct.unpack_from('<H', fb, vpos + 4 + idx * 2)[0]
-                if voff == 0:
+                tpos = root
+                soff = struct.unpack_from('<i', data, tpos)[0]
+                if abs(soff) > len(data):
                     continue
-                abs_off = tpos + voff
-                if ftype == "int":
-                    val = struct.unpack_from('<i', fb, abs_off)[0]
-                    print(f"    {name}: {val}")
-                elif ftype == "long":
-                    val = struct.unpack_from('<q', fb, abs_off)[0]
-                    print(f"    {name}: {val}")
-                elif ftype == "string":
-                    str_rel = struct.unpack_from('<i', fb, abs_off)[0]
-                    if str_rel == 0:
+                vpos = tpos - soff
+                if vpos + 4 > len(data):
+                    continue
+                vsize = struct.unpack_from('<H', data, vpos)[0]
+                if vsize < 4 or vsize > 200:
+                    continue
+                num_fields = (vsize - 4) // 2
+                print(f"  [skip={skip}] FlatBuffer: root={root} vpos={vpos} vsize={vsize} num_fields={num_fields}")
+                # Try to read string fields
+                for fi in range(num_fields):
+                    voff = struct.unpack_from('<H', data, vpos + 4 + fi * 2)[0]
+                    if voff == 0:
                         continue
-                    str_abs = abs_off + str_rel
-                    str_len = struct.unpack_from('<I', fb, str_abs)[0]
-                    if 0 < str_len < 200:
-                        s = fb[str_abs+4:str_abs+4+str_len].decode('utf-8', errors='replace')
-                        if s.strip():
-                            print(f"    {name}: {s}")
-            print("  =====================\n")
-        except Exception as e:
-            print(f"  [decode error: {e}]")
+                    abs_off = tpos + voff
+                    if abs_off + 4 > len(data):
+                        continue
+                    # Try as string (uoffset)
+                    try:
+                        str_rel = struct.unpack_from('<i', data, abs_off)[0]
+                        if str_rel > 0 and abs_off + str_rel + 4 <= len(data):
+                            str_abs = abs_off + str_rel
+                            slen = struct.unpack_from('<I', data, str_abs)[0]
+                            if 0 < slen < 200 and str_abs + 4 + slen <= len(data):
+                                s = data[str_abs+4:str_abs+4+slen].decode('utf-8', errors='replace')
+                                if s.strip() and s.isprintable():
+                                    print(f"    field[{fi}] str: {s}")
+                    except:
+                        pass
+                    # Try as int32
+                    try:
+                        ival = struct.unpack_from('<i', data, abs_off)[0]
+                        if 1 <= ival < 1000000:
+                            pass  # skip small ints for now
+                    except:
+                        pass
+            except:
+                continue
 
     def do_send_cmd(self, cmd_id):
         """Send empty command"""
