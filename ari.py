@@ -221,6 +221,7 @@ class AriaClient:
                 print(f"  [{elapsed}s] <- {name} (cmd={cmd}) len={len(body)}{e1009}")
                 self.responses.append(("login_resp", cmd, body))
                 self.last_response = body
+                self._auto_decode(cmd, body)
                 if cmd == 100:
                     self.logged_in = True
                     print(f"[+] Login confirmed (cmd=100 response)")
@@ -260,10 +261,66 @@ class AriaClient:
             name = CMD_NAMES.get(cmd, f"CMD_{cmd}")
             print(f"  <- {name} (cmd={cmd}) len={len(body)} hex={body[:60].hex()}")
             self.last_response = body
+            self._auto_decode(cmd, body)
             return cmd, body
         else:
             print("  No response (timeout)")
             return None, None
+
+    def _auto_decode(self, cmd, body):
+        """Auto-decode known command responses"""
+        if cmd == 104:
+            self._decode_role_info(body)
+
+    def _decode_role_info(self, body):
+        """Decode cmd=104 GetRoleInfo response"""
+        fb = body[4:]  # skip cmd+flags
+        if len(fb) < 8:
+            return
+        fields = [
+            (1, "RoleId", "long"), (2, "Name", "string"), (3, "Level", "int"),
+            (4, "Exp", "long"), (5, "Gender", "int"), (6, "Gold", "long"),
+            (7, "Diamond", "long"), (8, "BindDiamond", "long"),
+            (9, "ScrollTicket", "long"), (10, "Prelude", "int"),
+            (11, "SymbolCard", "int"), (12, "Greetings", "string"),
+            (15, "CreateDate", "string"), (16, "GuildName", "string"),
+            (19, "MainCityId", "int"), (21, "FishNum", "int"),
+            (22, "GuildId", "long"), (23, "Birthday", "string"),
+        ]
+        try:
+            root = struct.unpack_from('<I', fb, 0)[0]
+            tpos = root
+            soff = struct.unpack_from('<i', fb, tpos)[0]
+            vpos = tpos - soff
+            vsize = struct.unpack_from('<H', fb, vpos)[0]
+            num_fields = (vsize - 4) // 2
+            print("\n  === CHARACTER INFO ===")
+            for idx, name, ftype in fields:
+                if idx >= num_fields:
+                    continue
+                voff = struct.unpack_from('<H', fb, vpos + 4 + idx * 2)[0]
+                if voff == 0:
+                    continue
+                abs_off = tpos + voff
+                if ftype == "int":
+                    val = struct.unpack_from('<i', fb, abs_off)[0]
+                    print(f"    {name}: {val}")
+                elif ftype == "long":
+                    val = struct.unpack_from('<q', fb, abs_off)[0]
+                    print(f"    {name}: {val}")
+                elif ftype == "string":
+                    str_rel = struct.unpack_from('<i', fb, abs_off)[0]
+                    if str_rel == 0:
+                        continue
+                    str_abs = abs_off + str_rel
+                    str_len = struct.unpack_from('<I', fb, str_abs)[0]
+                    if 0 < str_len < 200:
+                        s = fb[str_abs+4:str_abs+4+str_len].decode('utf-8', errors='replace')
+                        if s.strip():
+                            print(f"    {name}: {s}")
+            print("  =====================\n")
+        except Exception as e:
+            print(f"  [decode error: {e}]")
 
     def do_send_cmd(self, cmd_id):
         """Send empty command"""
