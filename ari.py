@@ -273,68 +273,91 @@ class AriaClient:
             self._decode_role_info(body)
 
     def _decode_role_info(self, body):
-        """Decode cmd=104 GetRoleInfo response — hexdump + attempt FlatBuffer decode"""
-        fb = body[4:]  # skip cmd(2)+flags(2)
-        print(f"\n  === CMD=104 RAW ({len(fb)}B) ===")
-        for i in range(0, min(len(fb), 512), 16):
-            chunk = fb[i:i+16]
-            hx = ' '.join(f'{b:02x}' for b in chunk)
-            asc = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
-            print(f"    {i:04x}: {hx:<48s} {asc}")
-        if len(fb) > 512:
-            print(f"    ... ({len(fb)-512} more bytes)")
-        print("  =================================\n")
+        """Decode cmd=104 GetRoleInfo — FlatBuffer at body[2:]"""
+        data = body[2:]  # FlatBuffer starts after 2-byte cmd
+        if len(data) < 8:
+            print(f"  [cmd104 too short: {len(data)}B]")
+            return
+        try:
+            root = struct.unpack_from('<I', data, 0)[0]
+            tpos = root
+            soff = struct.unpack_from('<i', data, tpos)[0]
+            vpos = tpos - soff
+            vsize = struct.unpack_from('<H', data, vpos)[0]
+            osize = struct.unpack_from('<H', data, vpos + 2)[0]
+            num_slots = (vsize - 4) // 2
+        except Exception as e:
+            print(f"  [cmd104 header error: {e}]")
+            return
 
-        # Also try raw FlatBuffer with different skip amounts
-        for skip in [0, 2, 4, 6]:
-            data = body[skip:]
-            if len(data) < 8:
+        # Known fields from dump.cs (schema_field_id -> name, type)
+        # FlatBuffer vtable slot = schema_field_id
+        KNOWN = {
+            1: ("RoleId", "long"), 2: ("Name", "string"), 3: ("Level", "int"),
+            4: ("Exp", "long"), 5: ("Gender", "int"), 6: ("Gold", "long"),
+            7: ("Diamond", "long"), 8: ("BindDiamond", "long"),
+            9: ("ScrollTicket", "long"), 10: ("Prelude", "int"),
+            11: ("SymbolCard", "int"), 12: ("Greetings", "string"),
+            13: ("Icon", "int"), 14: ("IconFrame", "int"),
+            15: ("CreateDate", "string"), 16: ("GuildName", "string"),
+            17: ("HeadFrame", "int"), 18: ("TitleId", "int"),
+            19: ("MainCityId", "int"), 20: ("VipLevel", "int"),
+            21: ("FishNum", "int"), 22: ("GuildId", "long"),
+            23: ("Birthday", "string"),
+        }
+
+        print(f"\n  === CHARACTER INFO (RoleInfo) ===")
+        for slot in range(num_slots):
+            voff = struct.unpack_from('<H', data, vpos + 4 + slot * 2)[0]
+            if voff == 0:
                 continue
+            abs_off = tpos + voff
+            if abs_off >= len(data):
+                continue
+
+            name, ftype = KNOWN.get(slot, (f"field_{slot}", "unknown"))
             try:
-                root = struct.unpack_from('<I', data, 0)[0]
-                if root > len(data) or root < 4:
-                    continue
-                tpos = root
-                soff = struct.unpack_from('<i', data, tpos)[0]
-                if abs(soff) > len(data):
-                    continue
-                vpos = tpos - soff
-                if vpos + 4 > len(data):
-                    continue
-                vsize = struct.unpack_from('<H', data, vpos)[0]
-                if vsize < 4 or vsize > 200:
-                    continue
-                num_fields = (vsize - 4) // 2
-                print(f"  [skip={skip}] FlatBuffer: root={root} vpos={vpos} vsize={vsize} num_fields={num_fields}")
-                # Try to read string fields
-                for fi in range(num_fields):
-                    voff = struct.unpack_from('<H', data, vpos + 4 + fi * 2)[0]
-                    if voff == 0:
-                        continue
-                    abs_off = tpos + voff
-                    if abs_off + 4 > len(data):
-                        continue
-                    # Try as string (uoffset)
+                if ftype == "int":
+                    val = struct.unpack_from('<i', data, abs_off)[0]
+                    print(f"    {name}: {val}")
+                elif ftype == "long":
+                    val = struct.unpack_from('<q', data, abs_off)[0]
+                    print(f"    {name}: {val}")
+                elif ftype == "float":
+                    val = struct.unpack_from('<f', data, abs_off)[0]
+                    print(f"    {name}: {val:.2f}")
+                elif ftype == "string":
+                    str_rel = struct.unpack_from('<i', data, abs_off)[0]
+                    if str_rel > 0 and abs_off + str_rel + 4 <= len(data):
+                        str_abs = abs_off + str_rel
+                        slen = struct.unpack_from('<I', data, str_abs)[0]
+                        if 0 < slen < 500 and str_abs + 4 + slen <= len(data):
+                            s = data[str_abs+4:str_abs+4+slen].decode('utf-8', errors='replace')
+                            print(f"    {name}: {s}")
+                else:
+                    # Brute: try int, long, string
+                    ival = struct.unpack_from('<i', data, abs_off)[0]
+                    lval = struct.unpack_from('<q', data, abs_off)[0]
                     try:
                         str_rel = struct.unpack_from('<i', data, abs_off)[0]
-                        if str_rel > 0 and abs_off + str_rel + 4 <= len(data):
+                        if 0 < str_rel < len(data):
                             str_abs = abs_off + str_rel
-                            slen = struct.unpack_from('<I', data, str_abs)[0]
-                            if 0 < slen < 200 and str_abs + 4 + slen <= len(data):
-                                s = data[str_abs+4:str_abs+4+slen].decode('utf-8', errors='replace')
-                                if s.strip() and s.isprintable():
-                                    print(f"    field[{fi}] str: {s}")
+                            if str_abs + 4 <= len(data):
+                                slen = struct.unpack_from('<I', data, str_abs)[0]
+                                if 0 < slen < 200 and str_abs + 4 + slen <= len(data):
+                                    s = data[str_abs+4:str_abs+4+slen].decode('utf-8', errors='replace')
+                                    if s.isprintable():
+                                        print(f"    {name}: {s}  [str]")
+                                        continue
                     except:
                         pass
-                    # Try as int32
-                    try:
-                        ival = struct.unpack_from('<i', data, abs_off)[0]
-                        if 1 <= ival < 1000000:
-                            pass  # skip small ints for now
-                    except:
-                        pass
+                    if 0 < ival < 10000000:
+                        print(f"    {name}: {ival}  [int]")
+                    elif 0 < lval < 100000000000:
+                        print(f"    {name}: {lval}  [long]")
             except:
-                continue
+                pass
+        print(f"  =====================================\n")
 
     def do_send_cmd(self, cmd_id):
         """Send empty command"""
