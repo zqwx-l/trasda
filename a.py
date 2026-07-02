@@ -1,137 +1,155 @@
 #!/usr/bin/env python3
-"""Test login with correct 4-byte BE header from real capture."""
-import struct, socket, time, requests, sys
+"""Test login with correct 4-byte BE header from real capture.
+Usage: python a.py [loginId] [password]
+"""
+import struct, socket, time, sys, base64
+
+try:
+    import requests
+except ImportError:
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests", "-q"])
+    import requests
 
 LOGIN_URL = "https://login-en-dev.mcorz.com/login/"
 LOGIN_ID = sys.argv[1] if len(sys.argv) > 1 else "8034174"
-PASSWORD = sys.argv[2] if len(sys.argv) > 2 else open("/root/.aria_pass").read().strip()
+PW = sys.argv[2] if len(sys.argv) > 2 else "gf6dhbnx"
 GAME_HOST = "47.236.159.0"
 GAME_PORT = 8000
-CAPTURE = "/mnt/c/Users/Public/aria_login_token/fresh_login_000000.bin"
 
-# === 1. HTTP LOGIN ===
-print("[1] HTTP login...")
-resp = requests.post(LOGIN_URL, verify=False, data={
-    "publisher": 688, "serverId": 1,
-    "loginId": LOGIN_ID, "password": PASSWORD
-}, timeout=10)
-info = resp.json()
-token = info.get("token", "")
-role_id = int(info.get("roleId", 0))
-print(f"  token={token} roleId={role_id}")
+# 430-byte login capture from real game session
+# Header: 000001aa (BE frame_len=426) + 0064 (BE cmd=100=Login)
+LOGIN_CAPTURE = base64.b64decode(
+    "AAABqgBkOAAAAAAAAAAwAGQABAAIAAwAEABQABQAGAAcACAAJAAoACwAMAAAADQAOAA8AFgAQABE"
+    "AEgATAAwAAAAsAIAAAEAAABUAQAAKAEAABgBAAABAAAA+AAAAMwAAACwAAAAoAAAAAAFAADQAgAA"
+    "eAAAAGQPAABIAAAAPAAAADAAAAAkAAAAGAAAADHREg2fAQAAV/+YAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAMjViMzU5NzUyZWY1ODZiMDJjZWNkMjMzNTQyMzI3"
+    "NDQAAAAAFgAAAEFSTXY3IFZGUHYzIE5FT04gVk1ILTMAAAQAAABXSUZJAAAAABAAAABTYW1zdW5n"
+    "IFNNLUEyMTdNAAAAACIAAABBbmRyb2lkIE9TIDEyIC8gQVBJLTMyIChWNDE3SVIvODEpAAATAAAA"
+    "MjAyNS0wNS0wNi0xMC01OS00NwAHAAAARkJfMTAyMAAgAAAAQTE0ODc5NDkzNEM2NEM5RTlBQjg1"
+    "RDE0RDNFNTM2RUUAAAAACAAAADgwMzQxOTAgAAAAAA=="
+)
 
-# === 2. LOAD & PATCH CAPTURE ===
-print("\n[2] Loading & patching capture...")
-with open(CAPTURE, "rb") as f:
-    pkt = bytearray(f.read())
-print(f"  Loaded {len(pkt)}B, header={pkt[:6].hex()}")
-
-FB = 6
-root = struct.unpack_from('<I', pkt, FB)[0]
-tpos = FB + root
-soff = struct.unpack_from('<i', pkt, tpos)[0]
-vpos = tpos - soff
-print(f"  FB: root={root} tpos={tpos} vpos={vpos}")
-
-def voff(idx):
-    o = struct.unpack_from('<H', pkt, vpos + 4 + idx * 2)[0]
-    return tpos + o if o != 0 else None
-
-# Patch Token (field 3)
-t_abs = voff(3)
-t_rel = struct.unpack_from('<i', pkt, t_abs)[0]
-t_str = t_abs + t_rel
-t_len = struct.unpack_from('<I', pkt, t_str)[0]
-old_t = pkt[t_str+4:t_str+4+t_len].decode()
-if len(token) != t_len:
-    print(f"  Token len mismatch! old={t_len} new={len(token)}, padding/truncating")
-    token = token[:t_len].ljust(t_len, '0')
-pkt[t_str+4:t_str+4+t_len] = token.encode('ascii')
-print(f"  Token patched: {old_t} -> {token}")
-
-# Patch Time (field 4)
-time_abs = voff(4)
-if time_abs:
-    old_time = struct.unpack_from('<q', pkt, time_abs)[0]
-    now_ms = int(time.time() * 1000)
-    struct.pack_into('<q', pkt, time_abs, now_ms)
-    print(f"  Time patched: {old_time} -> {now_ms}")
-
-# Patch RoleId (field 17)
-role_abs = voff(17)
-if role_abs:
-    old_role = struct.unpack_from('<q', pkt, role_abs)[0]
-    struct.pack_into('<q', pkt, role_abs, role_id)
-    print(f"  RoleId patched: {old_role} -> {role_id}")
-
-# === 3. TCP ===
-print(f"\n[3] Connecting {GAME_HOST}:{GAME_PORT}...")
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-sock.settimeout(10)
-sock.connect((GAME_HOST, GAME_PORT))
-print("  Connected!")
-
-# === 4. READ INIT ===
-print("\n[4] Server init...")
-while True:
-    try:
-        sock.settimeout(2)
-        hdr = sock.recv(4)
-        if not hdr or len(hdr) < 4:
+def recv_full(sock, fl):
+    body = b""
+    while len(body) < fl:
+        chunk = sock.recv(fl - len(body))
+        if not chunk:
             break
-        fl = struct.unpack('>I', hdr)[0]
-        body = b""
-        while len(body) < fl:
-            chunk = sock.recv(fl - len(body))
-            if not chunk:
-                break
-            body += chunk
-        if len(body) >= 2:
-            cmd = struct.unpack('>H', body[:2])[0]
-            print(f"  Init: cmd={cmd} len={fl}")
-    except socket.timeout:
-        break
+        body += chunk
+    return body
 
-# === 5. SEND LOGIN ===
-print(f"\n[5] Sending login ({len(pkt)}B) header={pkt[:6].hex()}...")
-sock.sendall(bytes(pkt))
-
-# === 6. RESPONSES ===
-print("\n[6] Responses:")
-start = time.time()
-while time.time() - start < 30:
+def main():
     try:
-        sock.settimeout(5)
-        hdr = sock.recv(4)
-        if not hdr or len(hdr) < 4:
-            print("  Connection closed")
-            break
-        fl = struct.unpack('>I', hdr)[0]
-        body = b""
-        while len(body) < fl:
-            chunk = sock.recv(fl - len(body))
-            if not chunk:
-                break
-            body += chunk
-        elapsed = int(time.time() - start)
-        if len(body) >= 2:
-            cmd = struct.unpack('>H', body[:2])[0]
-            print(f"  [{elapsed}s] cmd={cmd} len={fl} body={body[:60].hex()}")
-        else:
-            print(f"  [{elapsed}s] len={fl} body={body.hex()}")
-    except socket.timeout:
-        elapsed = int(time.time() - start)
-        print(f"  [{elapsed}s] timeout, sending ping...")
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except:
+        pass
+
+    # === 1. HTTP LOGIN ===
+    print("[1] HTTP login...")
+    resp = requests.post(LOGIN_URL, verify=False, data={
+        "publisher": 688, "serverId": 1,
+        "loginId": LOGIN_ID, "password": PW
+    }, timeout=10)
+    info = resp.json()
+    token = info.get("token", "")
+    role_id = int(info.get("roleId", 0))
+    print(f"  token={token} roleId={role_id}")
+
+    # === 2. LOAD & PATCH ===
+    print("\n[2] Patching capture...")
+    pkt = bytearray(LOGIN_CAPTURE)
+    print(f"  {len(pkt)}B header={pkt[:6].hex()}")
+
+    FB = 6
+    root = struct.unpack_from('<I', pkt, FB)[0]
+    tpos = FB + root
+    soff = struct.unpack_from('<i', pkt, tpos)[0]
+    vpos = tpos - soff
+
+    def field_abs(idx):
+        o = struct.unpack_from('<H', pkt, vpos + 4 + idx * 2)[0]
+        return tpos + o if o else None
+
+    # Token (field 3)
+    a = field_abs(3)
+    r = struct.unpack_from('<i', pkt, a)[0]
+    s = a + r
+    n = struct.unpack_from('<I', pkt, s)[0]
+    old = pkt[s+4:s+4+n].decode()
+    t = token[:n].ljust(n, '0')
+    pkt[s+4:s+4+n] = t.encode()
+    print(f"  Token: {old} -> {t}")
+
+    # Time (field 4)
+    a = field_abs(4)
+    if a:
+        ms = int(time.time() * 1000)
+        struct.pack_into('<q', pkt, a, ms)
+        print(f"  Time: {ms}")
+
+    # RoleId (field 17)
+    a = field_abs(17)
+    if a:
+        struct.pack_into('<q', pkt, a, role_id)
+        print(f"  RoleId: {role_id}")
+
+    # === 3. TCP ===
+    print(f"\n[3] Connect {GAME_HOST}:{GAME_PORT}...")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.settimeout(10)
+    sock.connect((GAME_HOST, GAME_PORT))
+    print("  OK!")
+
+    # === 4. INIT ===
+    print("\n[4] Init...")
+    while True:
         try:
-            ping_payload = struct.pack('>H', 900) + struct.pack('>H', 0x1000)
-            frame = struct.pack('>I', len(ping_payload)) + ping_payload
-            sock.sendall(frame)
-        except:
+            sock.settimeout(2)
+            h = sock.recv(4)
+            if not h or len(h) < 4: break
+            fl = struct.unpack('>I', h)[0]
+            b = recv_full(sock, fl)
+            if len(b) >= 2:
+                print(f"  cmd={struct.unpack('>H', b[:2])[0]} len={fl}")
+        except socket.timeout:
             break
-    except Exception as e:
-        print(f"  Error: {e}")
-        break
 
-sock.close()
-print("\nDone.")
+    # === 5. SEND LOGIN ===
+    print(f"\n[5] Login ({len(pkt)}B)...")
+    sock.sendall(bytes(pkt))
+
+    # === 6. RESPONSES ===
+    print("\n[6] Responses:")
+    t0 = time.time()
+    while time.time() - t0 < 30:
+        try:
+            sock.settimeout(5)
+            h = sock.recv(4)
+            if not h or len(h) < 4:
+                print("  Closed")
+                break
+            fl = struct.unpack('>I', h)[0]
+            b = recv_full(sock, fl)
+            e = int(time.time() - t0)
+            if len(b) >= 2:
+                print(f"  [{e}s] cmd={struct.unpack('>H', b[:2])[0]} len={fl} hex={b[:40].hex()}")
+        except socket.timeout:
+            e = int(time.time() - t0)
+            print(f"  [{e}s] timeout, ping...")
+            try:
+                p = struct.pack('>H', 900) + struct.pack('>H', 0x1000)
+                sock.sendall(struct.pack('>I', len(p)) + p)
+            except:
+                break
+        except Exception as ex:
+            print(f"  Err: {ex}")
+            break
+
+    sock.close()
+    print("\nDone.")
+
+if __name__ == "__main__":
+    main()
