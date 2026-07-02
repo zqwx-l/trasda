@@ -312,7 +312,7 @@ class AriaClient:
                             try:
                                 s = raw.decode('utf-8')
                                 if s.isprintable() and len(s.strip()) > 0:
-                                    print(f"    [{slot:2d}] "{s}"  (str, off={voff})")
+                                    print(f"    [{slot:2d}] \"{s}\"  (str, off={voff})")
                                     is_string = True
                             except:
                                 pass
